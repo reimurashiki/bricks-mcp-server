@@ -1,6 +1,6 @@
 {
   "name": "bricks-mcp-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP Server for Bricks Builder - Manage Bricks pages, templates and elements from Claude Code",
   "type": "module",
   "main": "dist/bricks-mcp-server.js",
