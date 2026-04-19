@@ -247,6 +247,16 @@ function bricks_mcp_can_edit_post($post_id) {
     return current_user_can('edit_post', $post_id);
 }
 
+function bricks_mcp_get_value_type($value) {
+    if (is_array($value)) return 'array';
+    if (is_string($value)) return 'string';
+    if (is_int($value) || is_float($value)) return 'number';
+    if (is_bool($value)) return 'boolean';
+    if (is_null($value)) return 'null';
+    if (is_object($value)) return 'object';
+    return 'null';
+}
+
 add_action('rest_api_init', function () {
     register_rest_route('bricks-mcp/v1', '/page-elements/(?P<id>\d+)', [
         [
@@ -289,23 +299,19 @@ add_action('rest_api_init', function () {
                     return new WP_Error('invalid_elements', 'elements must be an array', ['status' => 400]);
                 }
                 $elements = bricks_mcp_normalize_elements($elements);
-                $elements_json = wp_json_encode($elements, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-                if (!is_string($elements_json)) {
-                    return new WP_Error('encode_failed', 'Failed to encode elements JSON', ['status' => 500]);
-                }
 
                 $elements_meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
                 $elements_meta_aliases = bricks_mcp_get_elements_meta_aliases($post_id, $elements_meta_key);
                 $editor_mode_key = bricks_mcp_get_editor_mode_key();
                 $page_settings_key = bricks_mcp_get_page_settings_key();
 
-                // Store as JSON string across detected aliases to match Bricks versioned key readers.
+                // Store as array across detected aliases for render-safe mode.
                 foreach ($elements_meta_aliases as $meta_key) {
-                    update_post_meta($post_id, $meta_key, $elements_json);
+                    update_post_meta($post_id, $meta_key, $elements);
                 }
 
                 // Compatibility mirror for integrations still reading base key.
-                update_post_meta($post_id, '_bricks_page_content', $elements_json);
+                update_post_meta($post_id, '_bricks_page_content', $elements);
 
                 update_post_meta($post_id, $page_settings_key, [
                     'editorMode' => 'bricks',
@@ -328,5 +334,60 @@ add_action('rest_api_init', function () {
             },
             'permission_callback' => '__return_true',
         ],
+    ]);
+
+    register_rest_route('bricks-mcp/v1', '/meta-dump/(?P<id>\d+)', [
+        'methods' => WP_REST_Server::READABLE,
+        'callback' => function (WP_REST_Request $request) {
+            $post_id = (int) $request['id'];
+            $post = get_post($post_id);
+            if (!$post) {
+                return new WP_Error('not_found', 'Post not found', ['status' => 404]);
+            }
+
+            if (!bricks_mcp_can_edit_post($post_id)) {
+                return new WP_Error('forbidden', 'Insufficient permissions', ['status' => 403]);
+            }
+
+            $all_meta = get_post_meta($post_id);
+            $meta_out = [];
+
+            if (is_array($all_meta)) {
+                foreach ($all_meta as $meta_key => $values) {
+                    $raw_value = get_post_meta($post_id, $meta_key, true);
+                    $type = bricks_mcp_get_value_type($raw_value);
+                    $entry = [
+                        'type' => $type,
+                    ];
+
+                    if (is_string($meta_key) && strpos($meta_key, '_bricks_') === 0) {
+                        $entry['raw'] = $raw_value;
+                    } else {
+                        if (is_array($raw_value) || is_object($raw_value)) {
+                            $preview = '[complex]';
+                        } elseif (is_string($raw_value)) {
+                            $preview = mb_substr($raw_value, 0, 120);
+                        } elseif (is_null($raw_value)) {
+                            $preview = '';
+                        } elseif (is_bool($raw_value)) {
+                            $preview = $raw_value ? 'true' : 'false';
+                        } else {
+                            $preview = (string) $raw_value;
+                        }
+
+                        $entry['preview'] = $preview;
+                    }
+
+                    $meta_out[$meta_key] = $entry;
+                }
+            }
+
+            return [
+                'post_id' => $post_id,
+                'post_type' => $post->post_type,
+                'meta' => $meta_out,
+            ];
+        },
+        'permission_callback' => '__return_true',
     ]);
 });
