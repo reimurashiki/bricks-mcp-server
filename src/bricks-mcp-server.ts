@@ -1435,28 +1435,20 @@ const BRICKS_CONTENT_MARKER_SUFFIX = ']]';
 const BRICKS_CONTENT_MARKER_PREFIX_LEGACY = '<!-- BRICKS_MCP_CONTENT:';
 const BRICKS_CONTENT_MARKER_SUFFIX_LEGACY = ' -->';
 
-function encodeBricksContentForMarker(elements: any[]): string {
-  return Buffer.from(JSON.stringify(elements), 'utf8').toString('base64');
+function buildBricksPageSettingsMeta(): string {
+  return JSON.stringify({
+    editorMode: 'bricks',
+    editor: 'bricks',
+    builder: 'bricks',
+  });
 }
 
-function decodeBricksContentFromMarker(encoded: string): any[] {
-  const json = Buffer.from(encoded, 'base64').toString('utf8');
-  const parsed = JSON.parse(json);
-  return Array.isArray(parsed) ? parsed : [];
-}
-
-function extractBricksContentMarker(content: string): any[] {
+function removeBricksContentMarkers(content: string): string {
   if (!content || typeof content !== 'string') {
-    return [];
+    return '';
   }
 
-  const normalizedContent = content
-    .replaceAll('&#91;', '[')
-    .replaceAll('&#93;', ']')
-    .replaceAll('&lbrack;', '[')
-    .replaceAll('&rbrack;', ']')
-    .replaceAll('&amp;#91;', '[')
-    .replaceAll('&amp;#93;', ']');
+  let cleaned = content;
 
   const variants: Array<{ start: string; end: string }> = [
     { start: BRICKS_CONTENT_MARKER_PREFIX, end: BRICKS_CONTENT_MARKER_SUFFIX },
@@ -1464,48 +1456,25 @@ function extractBricksContentMarker(content: string): any[] {
   ];
 
   for (const variant of variants) {
-    const startIndex = normalizedContent.indexOf(variant.start);
-    if (startIndex === -1) {
-      continue;
-    }
+    let startIndex = cleaned.indexOf(variant.start);
+    while (startIndex !== -1) {
+      const encodedStart = startIndex + variant.start.length;
+      const endIndex = cleaned.indexOf(variant.end, encodedStart);
+      if (endIndex === -1) {
+        break;
+      }
 
-    const encodedStart = startIndex + variant.start.length;
-    const endIndex = normalizedContent.indexOf(variant.end, encodedStart);
-    if (endIndex === -1) {
-      continue;
-    }
-
-    const encoded = normalizedContent.slice(encodedStart, endIndex).trim();
-    if (!encoded) {
-      continue;
-    }
-
-    try {
-      return decodeBricksContentFromMarker(encoded);
-    } catch {
-      continue;
+      cleaned = `${cleaned.slice(0, startIndex)}${cleaned.slice(endIndex + variant.end.length)}`;
+      startIndex = cleaned.indexOf(variant.start);
     }
   }
 
-  return [];
+  return cleaned.replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function upsertBricksContentMarker(content: string, elements: any[]): string {
-  const safeContent = typeof content === 'string' ? content : '';
-  const marker = `${BRICKS_CONTENT_MARKER_PREFIX}${encodeBricksContentForMarker(elements)}${BRICKS_CONTENT_MARKER_SUFFIX}`;
-
-  const startIndex = safeContent.indexOf(BRICKS_CONTENT_MARKER_PREFIX);
-  if (startIndex === -1) {
-    return safeContent ? `${safeContent}\n\n${marker}` : marker;
-  }
-
-  const encodedStart = startIndex + BRICKS_CONTENT_MARKER_PREFIX.length;
-  const endIndex = safeContent.indexOf(BRICKS_CONTENT_MARKER_SUFFIX, encodedStart);
-  if (endIndex === -1) {
-    return `${safeContent}\n\n${marker}`;
-  }
-
-  return `${safeContent.slice(0, startIndex)}${marker}${safeContent.slice(endIndex + BRICKS_CONTENT_MARKER_SUFFIX.length)}`;
+  // Disabled intentionally: fallback marker write is no longer used for persistence.
+  return removeBricksContentMarkers(content);
 }
 
 function getPostTypeEndpoint(postType: string, postId?: number): string {
@@ -1521,18 +1490,6 @@ class BricksClient {
 
   private extractBricksElements(postData: any): any[] {
     const meta = postData?.meta || {};
-    const contentRaw = postData?.content?.raw || postData?.content?.rendered || '';
-    const excerptRaw = postData?.excerpt?.raw || postData?.excerpt?.rendered || '';
-
-    const markerElements = extractBricksContentMarker(contentRaw);
-    if (markerElements.length > 0) {
-      return markerElements;
-    }
-
-    const excerptMarkerElements = extractBricksContentMarker(excerptRaw);
-    if (excerptMarkerElements.length > 0) {
-      return excerptMarkerElements;
-    }
 
     const bricksContent = BRICKS_CONTENT_META_KEYS
       .map((key) => meta[key] ?? postData?.[key] ?? meta[key.replace(/^_/, '')] ?? postData?.[key.replace(/^_/, '')])
@@ -1554,19 +1511,44 @@ class BricksClient {
     return [];
   }
 
-  private async persistBricksElementsInContent(postId: number, postType: string, elements: any[], site?: string): Promise<void> {
+  private async cleanupVisibleBricksMarker(postId: number, postType: string, site?: string): Promise<void> {
     const api = this.getApiClient(site);
     const endpoint = getPostTypeEndpoint(postType, postId);
     const current = await api.get(endpoint, { params: { context: 'edit' } });
     const currentContent = current.data?.content?.raw || current.data?.content?.rendered || '';
-    const currentExcerpt = current.data?.excerpt?.raw || current.data?.excerpt?.rendered || '';
-    const nextContent = upsertBricksContentMarker(currentContent, elements);
-    const nextExcerpt = upsertBricksContentMarker(currentExcerpt, elements);
+    const cleanedContent = removeBricksContentMarkers(currentContent);
 
-    await api.post(endpoint, {
-      content: nextContent,
-      excerpt: nextExcerpt,
-    });
+    if (cleanedContent !== currentContent) {
+      await api.post(endpoint, { content: cleanedContent });
+    }
+  }
+
+  private async getPageElementsViaMetaBridge(postId: number, postType: string, site?: string): Promise<any[] | null> {
+    const api = this.getApiClient(site);
+
+    try {
+      const response = await api.get(`/bricks-mcp/v1/page-elements/${postId}`, {
+        params: { post_type: postType },
+      });
+      const bridgeElements = response.data?.elements;
+      return Array.isArray(bridgeElements) ? bridgeElements : [];
+    } catch {
+      return null;
+    }
+  }
+
+  private async setPageElementsViaMetaBridge(postId: number, elements: any[], postType: string, site?: string): Promise<boolean> {
+    const api = this.getApiClient(site);
+
+    try {
+      await api.post(`/bricks-mcp/v1/page-elements/${postId}`, {
+        post_type: postType,
+        elements,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private getApiClient(site?: string): AxiosInstance {
@@ -1607,7 +1589,14 @@ class BricksClient {
     const normalizedPostType = normalizePostType(postType);
     const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
-    const elements = this.extractBricksElements(response.data);
+    let elements = this.extractBricksElements(response.data);
+
+    if (elements.length === 0) {
+      const bridgeElements = await this.getPageElementsViaMetaBridge(postId, normalizedPostType, site);
+      if (Array.isArray(bridgeElements) && bridgeElements.length > 0) {
+        elements = bridgeElements;
+      }
+    }
 
     return {
       post_id: response.data.id,
@@ -1623,34 +1612,39 @@ class BricksClient {
     const api = this.getApiClient(site);
     const normalizedPostType = normalizePostType(postType);
     const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
+    const pageSettingsMeta = buildBricksPageSettingsMeta();
+
     await api.post(endpoint, {
       meta: {
         _bricks_page_content_2: JSON.stringify(elements),
         _bricks_page_content: JSON.stringify(elements),
+        _bricks_page_settings: pageSettingsMeta,
+        _bricks_editor_mode: 'bricks',
       },
     });
 
     const persisted = await this.getPageElements(postId, normalizedPostType, site);
     let isPersisted = persisted.element_count === elements.length;
-    let readBackCount = persisted.element_count;
-    let storage = 'meta';
+    let storage: 'meta' | 'meta_bridge' = 'meta';
 
     if (!isPersisted) {
-      await this.persistBricksElementsInContent(postId, normalizedPostType, elements, site);
-      const persistedFromContent = await this.getPageElements(postId, normalizedPostType, site);
-      isPersisted = persistedFromContent.element_count === elements.length;
-      readBackCount = persistedFromContent.element_count;
-
-      if (isPersisted) {
-        storage = 'content_marker';
+      const bridgeWriteOk = await this.setPageElementsViaMetaBridge(postId, elements, normalizedPostType, site);
+      if (bridgeWriteOk) {
+        const persistedFromBridge = await this.getPageElements(postId, normalizedPostType, site);
+        if (persistedFromBridge.element_count === elements.length) {
+          isPersisted = true;
+          storage = 'meta_bridge';
+        }
       }
     }
 
     if (!isPersisted) {
       throw new Error(
-        `Bricks content persistence mismatch on post ${postId}: expected ${elements.length} elements, read back ${readBackCount}.`
+        `Bricks meta persistence mismatch on post ${postId}: expected ${elements.length} elements in Bricks meta (_bricks_page_content_2), read back ${persisted.element_count}. REST meta appears blocked. Register Bricks meta with show_in_rest or install bridge endpoint /bricks-mcp/v1/page-elements.`
       );
     }
+
+    await this.cleanupVisibleBricksMarker(postId, normalizedPostType, site);
 
     return {
       post_id: persisted.post_id,
