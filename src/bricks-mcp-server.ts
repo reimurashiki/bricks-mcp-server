@@ -1415,8 +1415,102 @@ function generateSection(sectionType: string, overrides: Record<string, any> = {
 
 // ===== CPT ENDPOINT HELPER =====
 
+function normalizePostType(postType: string = 'pages'): string {
+  const normalized = String(postType || 'pages').trim().toLowerCase();
+
+  if (normalized === 'page' || normalized === 'pages') {
+    return 'pages';
+  }
+
+  if (normalized === 'post' || normalized === 'posts') {
+    return 'posts';
+  }
+
+  return normalized;
+}
+
+const BRICKS_CONTENT_META_KEYS = ['_bricks_page_content_2', '_bricks_page_content'];
+const BRICKS_CONTENT_MARKER_PREFIX = '[[BRICKS_MCP_CONTENT:';
+const BRICKS_CONTENT_MARKER_SUFFIX = ']]';
+const BRICKS_CONTENT_MARKER_PREFIX_LEGACY = '<!-- BRICKS_MCP_CONTENT:';
+const BRICKS_CONTENT_MARKER_SUFFIX_LEGACY = ' -->';
+
+function encodeBricksContentForMarker(elements: any[]): string {
+  return Buffer.from(JSON.stringify(elements), 'utf8').toString('base64');
+}
+
+function decodeBricksContentFromMarker(encoded: string): any[] {
+  const json = Buffer.from(encoded, 'base64').toString('utf8');
+  const parsed = JSON.parse(json);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function extractBricksContentMarker(content: string): any[] {
+  if (!content || typeof content !== 'string') {
+    return [];
+  }
+
+  const normalizedContent = content
+    .replaceAll('&#91;', '[')
+    .replaceAll('&#93;', ']')
+    .replaceAll('&lbrack;', '[')
+    .replaceAll('&rbrack;', ']')
+    .replaceAll('&amp;#91;', '[')
+    .replaceAll('&amp;#93;', ']');
+
+  const variants: Array<{ start: string; end: string }> = [
+    { start: BRICKS_CONTENT_MARKER_PREFIX, end: BRICKS_CONTENT_MARKER_SUFFIX },
+    { start: BRICKS_CONTENT_MARKER_PREFIX_LEGACY, end: BRICKS_CONTENT_MARKER_SUFFIX_LEGACY },
+  ];
+
+  for (const variant of variants) {
+    const startIndex = normalizedContent.indexOf(variant.start);
+    if (startIndex === -1) {
+      continue;
+    }
+
+    const encodedStart = startIndex + variant.start.length;
+    const endIndex = normalizedContent.indexOf(variant.end, encodedStart);
+    if (endIndex === -1) {
+      continue;
+    }
+
+    const encoded = normalizedContent.slice(encodedStart, endIndex).trim();
+    if (!encoded) {
+      continue;
+    }
+
+    try {
+      return decodeBricksContentFromMarker(encoded);
+    } catch {
+      continue;
+    }
+  }
+
+  return [];
+}
+
+function upsertBricksContentMarker(content: string, elements: any[]): string {
+  const safeContent = typeof content === 'string' ? content : '';
+  const marker = `${BRICKS_CONTENT_MARKER_PREFIX}${encodeBricksContentForMarker(elements)}${BRICKS_CONTENT_MARKER_SUFFIX}`;
+
+  const startIndex = safeContent.indexOf(BRICKS_CONTENT_MARKER_PREFIX);
+  if (startIndex === -1) {
+    return safeContent ? `${safeContent}\n\n${marker}` : marker;
+  }
+
+  const encodedStart = startIndex + BRICKS_CONTENT_MARKER_PREFIX.length;
+  const endIndex = safeContent.indexOf(BRICKS_CONTENT_MARKER_SUFFIX, encodedStart);
+  if (endIndex === -1) {
+    return `${safeContent}\n\n${marker}`;
+  }
+
+  return `${safeContent.slice(0, startIndex)}${marker}${safeContent.slice(endIndex + BRICKS_CONTENT_MARKER_SUFFIX.length)}`;
+}
+
 function getPostTypeEndpoint(postType: string, postId?: number): string {
-  const base = postType === 'pages' ? '/wp/v2/pages' : postType === 'posts' ? '/wp/v2/posts' : `/wp/v2/${postType}`;
+  const normalizedPostType = normalizePostType(postType);
+  const base = normalizedPostType === 'pages' ? '/wp/v2/pages' : normalizedPostType === 'posts' ? '/wp/v2/posts' : `/wp/v2/${normalizedPostType}`;
   return postId !== undefined ? `${base}/${postId}` : base;
 }
 
@@ -1424,6 +1518,56 @@ function getPostTypeEndpoint(postType: string, postId?: number): string {
 
 class BricksClient {
   private clients: Map<string, AxiosInstance> = new Map();
+
+  private extractBricksElements(postData: any): any[] {
+    const meta = postData?.meta || {};
+    const contentRaw = postData?.content?.raw || postData?.content?.rendered || '';
+    const excerptRaw = postData?.excerpt?.raw || postData?.excerpt?.rendered || '';
+
+    const markerElements = extractBricksContentMarker(contentRaw);
+    if (markerElements.length > 0) {
+      return markerElements;
+    }
+
+    const excerptMarkerElements = extractBricksContentMarker(excerptRaw);
+    if (excerptMarkerElements.length > 0) {
+      return excerptMarkerElements;
+    }
+
+    const bricksContent = BRICKS_CONTENT_META_KEYS
+      .map((key) => meta[key] ?? postData?.[key] ?? meta[key.replace(/^_/, '')] ?? postData?.[key.replace(/^_/, '')])
+      .find((value) => value !== undefined && value !== null && value !== '');
+
+    if (Array.isArray(bricksContent)) {
+      return bricksContent;
+    }
+
+    if (typeof bricksContent === 'string') {
+      try {
+        const parsed = JSON.parse(bricksContent);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        throw new Error('Invalid Bricks content format in "_bricks_page_content_2": expected valid JSON array.');
+      }
+    }
+
+    return [];
+  }
+
+  private async persistBricksElementsInContent(postId: number, postType: string, elements: any[], site?: string): Promise<void> {
+    const api = this.getApiClient(site);
+    const endpoint = getPostTypeEndpoint(postType, postId);
+    const current = await api.get(endpoint, { params: { context: 'edit' } });
+    const currentContent = current.data?.content?.raw || current.data?.content?.rendered || '';
+    const currentExcerpt = current.data?.excerpt?.raw || current.data?.excerpt?.rendered || '';
+    const nextContent = upsertBricksContentMarker(currentContent, elements);
+    const nextExcerpt = upsertBricksContentMarker(currentExcerpt, elements);
+
+    await api.post(endpoint, {
+      content: nextContent,
+      excerpt: nextExcerpt,
+    });
+  }
 
   private getApiClient(site?: string): AxiosInstance {
     const config = getSiteConfig(site);
@@ -1460,18 +1604,14 @@ class BricksClient {
 
   async getPageElements(postId: number, postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
-    const meta = response.data.meta || {};
-    const bricksContent = meta._bricks_page_content_2;
-
-    let elements: any[] = [];
-    if (bricksContent) {
-      elements = typeof bricksContent === 'string' ? JSON.parse(bricksContent) : bricksContent;
-    }
+    const elements = this.extractBricksElements(response.data);
 
     return {
       post_id: response.data.id,
+      post_type: normalizedPostType,
       title: response.data.title?.rendered || response.data.title?.raw || '',
       status: response.data.status,
       elements,
@@ -1481,18 +1621,45 @@ class BricksClient {
 
   async setPageElements(postId: number, elements: any[], postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
-    const response = await api.post(endpoint, {
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
+    await api.post(endpoint, {
       meta: {
         _bricks_page_content_2: JSON.stringify(elements),
+        _bricks_page_content: JSON.stringify(elements),
       },
     });
 
+    const persisted = await this.getPageElements(postId, normalizedPostType, site);
+    let isPersisted = persisted.element_count === elements.length;
+    let readBackCount = persisted.element_count;
+    let storage = 'meta';
+
+    if (!isPersisted) {
+      await this.persistBricksElementsInContent(postId, normalizedPostType, elements, site);
+      const persistedFromContent = await this.getPageElements(postId, normalizedPostType, site);
+      isPersisted = persistedFromContent.element_count === elements.length;
+      readBackCount = persistedFromContent.element_count;
+
+      if (isPersisted) {
+        storage = 'content_marker';
+      }
+    }
+
+    if (!isPersisted) {
+      throw new Error(
+        `Bricks content persistence mismatch on post ${postId}: expected ${elements.length} elements, read back ${readBackCount}.`
+      );
+    }
+
     return {
-      post_id: response.data.id,
-      title: response.data.title?.rendered || response.data.title?.raw || '',
-      status: response.data.status,
+      post_id: persisted.post_id,
+      post_type: normalizedPostType,
+      title: persisted.title,
+      status: persisted.status,
       element_count: elements.length,
+      persisted: isPersisted,
+      storage,
       success: true,
     };
   }
@@ -1667,11 +1834,12 @@ class BricksClient {
 
   async snapshotPage(postId: number, postType: string = 'pages', label?: string, site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const current = await this.getPageElements(postId, postType, site);
+    const normalizedPostType = normalizePostType(postType);
+    const current = await this.getPageElements(postId, normalizedPostType, site);
     const timestamp = Date.now();
     const snapshotKey = `_bricks_snapshot_${timestamp}`;
 
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     await api.post(endpoint, {
       meta: {
         [snapshotKey]: JSON.stringify({
@@ -1685,6 +1853,7 @@ class BricksClient {
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       snapshot_key: snapshotKey,
       element_count: current.elements.length,
       timestamp,
@@ -1695,7 +1864,8 @@ class BricksClient {
 
   async restoreSnapshot(postId: number, postType: string = 'pages', snapshotKey: string, site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
     const meta = response.data.meta || {};
     const snapshotRaw = meta[snapshotKey];
@@ -1707,10 +1877,11 @@ class BricksClient {
     const snapshot = typeof snapshotRaw === 'string' ? JSON.parse(snapshotRaw) : snapshotRaw;
     const elements = snapshot.elements || [];
 
-    await this.setPageElements(postId, elements, postType, site);
+    await this.setPageElements(postId, elements, normalizedPostType, site);
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       snapshot_key: snapshotKey,
       restored_element_count: elements.length,
       success: true,
@@ -1719,7 +1890,8 @@ class BricksClient {
 
   async listSnapshots(postId: number, postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
     const meta = response.data.meta || {};
 
@@ -1742,6 +1914,7 @@ class BricksClient {
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       snapshots,
       snapshot_count: snapshots.length,
     };
@@ -1749,7 +1922,8 @@ class BricksClient {
 
   async deleteSnapshot(postId: number, snapshotKey: string, postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = `${getPostTypeEndpoint(postType)}/${postId}`;
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = `${getPostTypeEndpoint(normalizedPostType)}/${postId}`;
     const response = await api.get(endpoint, { params: { context: 'edit' } });
     const meta = response.data.meta || {};
 
@@ -1764,6 +1938,7 @@ class BricksClient {
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       deleted_snapshot: snapshotKey,
       success: true,
     };
@@ -2168,7 +2343,8 @@ class BricksClient {
   }
 
   async clonePage(sourcePostId: number, newTitle: string, postType: string = 'pages', site?: string): Promise<any> {
-    const source = await this.getPageElements(sourcePostId, postType, site);
+    const normalizedPostType = normalizePostType(postType);
+    const source = await this.getPageElements(sourcePostId, normalizedPostType, site);
 
     // Re-generate all element IDs to avoid conflicts
     const idMap = new Map<string, string>();
@@ -2190,7 +2366,7 @@ class BricksClient {
 
     // Create clone using the same post type as source
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType);
     const payload: any = {
       title: newTitle,
       status: 'draft',
@@ -2204,7 +2380,7 @@ class BricksClient {
       id: response.data.id,
       title: response.data.title?.rendered || response.data.title?.raw || '',
       status: response.data.status,
-      post_type: postType,
+      post_type: normalizedPostType,
       source_post_id: sourcePostId,
       cloned_elements: clonedElements.length,
       success: true,
@@ -2240,19 +2416,22 @@ class BricksClient {
 
   async getPageCss(postId: number, postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
     const meta = response.data.meta || {};
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       css: meta._bricks_page_css_2 || '',
     };
   }
 
   async setPageCss(postId: number, css: string, postType: string = 'pages', site?: string): Promise<any> {
     const api = this.getApiClient(site);
-    const endpoint = getPostTypeEndpoint(postType, postId);
+    const normalizedPostType = normalizePostType(postType);
+    const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.post(endpoint, {
       meta: {
         _bricks_page_css_2: css,
@@ -2261,6 +2440,7 @@ class BricksClient {
 
     return {
       post_id: postId,
+      post_type: normalizedPostType,
       success: true,
     };
   }
