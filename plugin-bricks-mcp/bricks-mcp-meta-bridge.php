@@ -214,19 +214,6 @@ function bricks_mcp_normalize_element_settings($settings, $element_name = '') {
         return $settings;
     }
 
-    if (isset($settings['_backgroundColor']) && is_string($settings['_backgroundColor']) && !isset($settings['_background'])) {
-        $settings['_background'] = [ 'color' => $settings['_backgroundColor'] ];
-    }
-
-    if (isset($settings['_color']) && is_string($settings['_color'])) {
-        if (!isset($settings['_typography']) || !is_array($settings['_typography'])) {
-            $settings['_typography'] = [];
-        }
-        if (!isset($settings['_typography']['color'])) {
-            $settings['_typography']['color'] = $settings['_color'];
-        }
-    }
-
     if (isset($settings['_border'])) {
         $settings['_border'] = bricks_mcp_normalize_border($settings['_border']);
     }
@@ -302,25 +289,27 @@ add_action('rest_api_init', function () {
                     return new WP_Error('invalid_elements', 'elements must be an array', ['status' => 400]);
                 }
                 $elements = bricks_mcp_normalize_elements($elements);
+                $elements_json = wp_json_encode($elements, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                if (!is_string($elements_json)) {
+                    return new WP_Error('encode_failed', 'Failed to encode elements JSON', ['status' => 500]);
+                }
 
                 $elements_meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
-                $elements_meta_aliases = bricks_mcp_get_elements_meta_aliases($post_id, $elements_meta_key);
                 $editor_mode_key = bricks_mcp_get_editor_mode_key();
                 $page_settings_key = bricks_mcp_get_page_settings_key();
 
-                // Store as array post meta and mirror to versioned aliases.
-                foreach ($elements_meta_aliases as $meta_key) {
-                    update_post_meta($post_id, $meta_key, $elements);
-                }
+                // Store only on resolved authoritative key to avoid cross-version key poisoning.
+                update_post_meta($post_id, $elements_meta_key, $elements_json);
 
-                // Compatibility mirror for integrations still checking this key.
-                update_post_meta($post_id, '_bricks_page_content', $elements);
-
-                update_post_meta($post_id, $page_settings_key, [
+                $page_settings_json = wp_json_encode([
                     'editorMode' => 'bricks',
                     'editor' => 'bricks',
                     'builder' => 'bricks',
-                ]);
+                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+                if (is_string($page_settings_json)) {
+                    update_post_meta($post_id, $page_settings_key, $page_settings_json);
+                }
                 update_post_meta($post_id, $editor_mode_key, 'bricks');
 
                 $verified = bricks_mcp_get_elements_from_post($post_id);

@@ -1435,26 +1435,6 @@ const BRICKS_CONTENT_MARKER_SUFFIX = ']]';
 const BRICKS_CONTENT_MARKER_PREFIX_LEGACY = '<!-- BRICKS_MCP_CONTENT:';
 const BRICKS_CONTENT_MARKER_SUFFIX_LEGACY = ' -->';
 
-const BRICKS_VISUAL_SETTINGS_WHITELIST = new Set([
-  '_background',
-  '_backgroundColor',
-  '_color',
-  '_typography',
-  '_border',
-  '_borderRadius',
-  '_boxShadow',
-  '_opacity',
-]);
-
-const BRICKS_BUTTON_VISUAL_WHITELIST = new Set([
-  '_backgroundColor',
-  '_color',
-  '_border',
-  '_borderRadius',
-  '_boxShadow',
-  '_opacity',
-]);
-
 function buildBricksPageSettingsMeta(): string {
   return JSON.stringify({
     editorMode: 'bricks',
@@ -1533,37 +1513,8 @@ class BricksClient {
 
     const normalized: Record<string, any> = JSON.parse(JSON.stringify(settings));
 
-    // Ensure key visual styles are preserved and available in expected shapes.
-    if (typeof normalized._backgroundColor === 'string' && !this.isObject(normalized._background)) {
-      normalized._background = { color: normalized._backgroundColor };
-    }
-
-    if (typeof normalized._color === 'string') {
-      if (!this.isObject(normalized._typography)) {
-        normalized._typography = {};
-      }
-      if (normalized._typography.color === undefined) {
-        normalized._typography.color = normalized._color;
-      }
-    }
-
     if (normalized._border !== undefined) {
       normalized._border = this.normalizeBorderValue(normalized._border);
-    }
-
-    // No stripping: explicitly preserve visual keys even if upstream normalizer changes.
-    for (const key of BRICKS_VISUAL_SETTINGS_WHITELIST) {
-      if (settings[key] !== undefined && normalized[key] === undefined) {
-        normalized[key] = JSON.parse(JSON.stringify(settings[key]));
-      }
-    }
-
-    if (elementName === 'button') {
-      for (const key of BRICKS_BUTTON_VISUAL_WHITELIST) {
-        if (settings[key] !== undefined && normalized[key] === undefined) {
-          normalized[key] = JSON.parse(JSON.stringify(settings[key]));
-        }
-      }
     }
 
     return normalized;
