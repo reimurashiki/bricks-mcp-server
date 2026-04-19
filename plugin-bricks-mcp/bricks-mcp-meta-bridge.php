@@ -68,6 +68,71 @@ function bricks_mcp_get_elements_from_post($post_id) {
     return [];
 }
 
+function bricks_mcp_normalize_border($border) {
+    if (!is_array($border)) {
+        return $border;
+    }
+
+    if (isset($border['width']) && !is_array($border['width'])) {
+        $width = (string) $border['width'];
+        $border['width'] = [
+            'top' => $width,
+            'right' => $width,
+            'bottom' => $width,
+            'left' => $width,
+        ];
+    }
+
+    return $border;
+}
+
+function bricks_mcp_normalize_element_settings($settings, $element_name = '') {
+    if (!is_array($settings)) {
+        return $settings;
+    }
+
+    if (isset($settings['_backgroundColor']) && is_string($settings['_backgroundColor']) && !isset($settings['_background'])) {
+        $settings['_background'] = [ 'color' => $settings['_backgroundColor'] ];
+    }
+
+    if (isset($settings['_color']) && is_string($settings['_color'])) {
+        if (!isset($settings['_typography']) || !is_array($settings['_typography'])) {
+            $settings['_typography'] = [];
+        }
+        if (!isset($settings['_typography']['color'])) {
+            $settings['_typography']['color'] = $settings['_color'];
+        }
+    }
+
+    if (isset($settings['_border'])) {
+        $settings['_border'] = bricks_mcp_normalize_border($settings['_border']);
+    }
+
+    return $settings;
+}
+
+function bricks_mcp_normalize_elements($elements) {
+    if (!is_array($elements)) {
+        return [];
+    }
+
+    $out = [];
+    foreach ($elements as $element) {
+        if (!is_array($element)) {
+            continue;
+        }
+
+        $name = isset($element['name']) ? (string) $element['name'] : '';
+        if (isset($element['settings'])) {
+            $element['settings'] = bricks_mcp_normalize_element_settings($element['settings'], $name);
+        }
+
+        $out[] = $element;
+    }
+
+    return $out;
+}
+
 function bricks_mcp_can_edit_post($post_id) {
     return current_user_can('edit_post', $post_id);
 }
@@ -113,6 +178,7 @@ add_action('rest_api_init', function () {
                 if (!is_array($elements)) {
                     return new WP_Error('invalid_elements', 'elements must be an array', ['status' => 400]);
                 }
+                $elements = bricks_mcp_normalize_elements($elements);
 
                 $elements_meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
                 $editor_mode_key = bricks_mcp_get_editor_mode_key();

@@ -1435,6 +1435,26 @@ const BRICKS_CONTENT_MARKER_SUFFIX = ']]';
 const BRICKS_CONTENT_MARKER_PREFIX_LEGACY = '<!-- BRICKS_MCP_CONTENT:';
 const BRICKS_CONTENT_MARKER_SUFFIX_LEGACY = ' -->';
 
+const BRICKS_VISUAL_SETTINGS_WHITELIST = new Set([
+  '_background',
+  '_backgroundColor',
+  '_color',
+  '_typography',
+  '_border',
+  '_borderRadius',
+  '_boxShadow',
+  '_opacity',
+]);
+
+const BRICKS_BUTTON_VISUAL_WHITELIST = new Set([
+  '_backgroundColor',
+  '_color',
+  '_border',
+  '_borderRadius',
+  '_boxShadow',
+  '_opacity',
+]);
+
 function buildBricksPageSettingsMeta(): string {
   return JSON.stringify({
     editorMode: 'bricks',
@@ -1487,6 +1507,154 @@ function getPostTypeEndpoint(postType: string, postId?: number): string {
 
 class BricksClient {
   private clients: Map<string, AxiosInstance> = new Map();
+
+  private isObject(value: any): value is Record<string, any> {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  private normalizeBorderValue(border: any): any {
+    if (!this.isObject(border)) {
+      return border;
+    }
+
+    const out: any = { ...border };
+    if (typeof out.width === 'string' || typeof out.width === 'number') {
+      const width = String(out.width);
+      out.width = { top: width, right: width, bottom: width, left: width };
+    }
+
+    return out;
+  }
+
+  private normalizeSettingsForPersistence(settings: any, elementName: string): any {
+    if (!this.isObject(settings)) {
+      return settings;
+    }
+
+    const normalized: Record<string, any> = JSON.parse(JSON.stringify(settings));
+
+    // Ensure key visual styles are preserved and available in expected shapes.
+    if (typeof normalized._backgroundColor === 'string' && !this.isObject(normalized._background)) {
+      normalized._background = { color: normalized._backgroundColor };
+    }
+
+    if (typeof normalized._color === 'string') {
+      if (!this.isObject(normalized._typography)) {
+        normalized._typography = {};
+      }
+      if (normalized._typography.color === undefined) {
+        normalized._typography.color = normalized._color;
+      }
+    }
+
+    if (normalized._border !== undefined) {
+      normalized._border = this.normalizeBorderValue(normalized._border);
+    }
+
+    // No stripping: explicitly preserve visual keys even if upstream normalizer changes.
+    for (const key of BRICKS_VISUAL_SETTINGS_WHITELIST) {
+      if (settings[key] !== undefined && normalized[key] === undefined) {
+        normalized[key] = JSON.parse(JSON.stringify(settings[key]));
+      }
+    }
+
+    if (elementName === 'button') {
+      for (const key of BRICKS_BUTTON_VISUAL_WHITELIST) {
+        if (settings[key] !== undefined && normalized[key] === undefined) {
+          normalized[key] = JSON.parse(JSON.stringify(settings[key]));
+        }
+      }
+    }
+
+    return normalized;
+  }
+
+  private normalizeElementsForPersistence(elements: any[]): any[] {
+    return (elements || []).map((element: any) => {
+      if (!this.isObject(element)) {
+        return element;
+      }
+
+      const normalized = JSON.parse(JSON.stringify(element));
+      normalized.settings = this.normalizeSettingsForPersistence(normalized.settings, String(normalized.name || ''));
+      return normalized;
+    });
+  }
+
+  private containsExpectedValue(expected: any, actual: any): boolean {
+    if (Array.isArray(expected)) {
+      if (!Array.isArray(actual) || actual.length !== expected.length) {
+        return false;
+      }
+
+      return expected.every((item, index) => this.containsExpectedValue(item, actual[index]));
+    }
+
+    if (this.isObject(expected)) {
+      if (!this.isObject(actual)) {
+        return false;
+      }
+
+      for (const [key, value] of Object.entries(expected)) {
+        if (!(key in actual)) {
+          return false;
+        }
+
+        if (!this.containsExpectedValue(value, (actual as any)[key])) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    return expected === actual;
+  }
+
+  private persistedElementsContainExpected(expectedElements: any[], persistedElements: any[]): boolean {
+    if (!Array.isArray(expectedElements) || !Array.isArray(persistedElements)) {
+      return false;
+    }
+
+    if (expectedElements.length !== persistedElements.length) {
+      return false;
+    }
+
+    const persistedById = new Map<string, any>();
+    for (const element of persistedElements) {
+      if (this.isObject(element) && element.id !== undefined) {
+        persistedById.set(String(element.id), element);
+      }
+    }
+
+    for (let index = 0; index < expectedElements.length; index += 1) {
+      const expectedElement = expectedElements[index];
+      if (!this.isObject(expectedElement)) {
+        continue;
+      }
+
+      const expectedId = expectedElement.id !== undefined ? String(expectedElement.id) : '';
+      const candidate = expectedId ? persistedById.get(expectedId) : persistedElements[index];
+
+      if (!this.isObject(candidate)) {
+        return false;
+      }
+
+      const expectedName = String(expectedElement.name || '');
+      if (String(candidate.name || '') !== expectedName) {
+        return false;
+      }
+
+      const expectedSettings = this.normalizeSettingsForPersistence(expectedElement.settings, expectedName);
+      const persistedSettings = this.normalizeSettingsForPersistence(candidate.settings, String(candidate.name || ''));
+
+      if (!this.containsExpectedValue(expectedSettings, persistedSettings)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
 
   private extractBricksElements(postData: any): any[] {
     const meta = postData?.meta || {};
@@ -1589,14 +1757,10 @@ class BricksClient {
     const normalizedPostType = normalizePostType(postType);
     const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const response = await api.get(endpoint, { params: { context: 'edit' } });
-    let elements = this.extractBricksElements(response.data);
-
-    if (elements.length === 0) {
-      const bridgeElements = await this.getPageElementsViaMetaBridge(postId, normalizedPostType, site);
-      if (Array.isArray(bridgeElements) && bridgeElements.length > 0) {
-        elements = bridgeElements;
-      }
-    }
+    const bridgeElements = await this.getPageElementsViaMetaBridge(postId, normalizedPostType, site);
+    const elements = Array.isArray(bridgeElements)
+      ? bridgeElements
+      : this.extractBricksElements(response.data);
 
     return {
       post_id: response.data.id,
@@ -1613,45 +1777,51 @@ class BricksClient {
     const normalizedPostType = normalizePostType(postType);
     const endpoint = getPostTypeEndpoint(normalizedPostType, postId);
     const pageSettingsMeta = buildBricksPageSettingsMeta();
-
-    await api.post(endpoint, {
-      meta: {
-        _bricks_page_content_2: JSON.stringify(elements),
-        _bricks_page_content: JSON.stringify(elements),
-        _bricks_page_settings: pageSettingsMeta,
-        _bricks_editor_mode: 'bricks',
-      },
-    });
-
-    const persisted = await this.getPageElements(postId, normalizedPostType, site);
-    let isPersisted = persisted.element_count === elements.length;
+    const normalizedElements = this.normalizeElementsForPersistence(elements);
+    let isPersisted = false;
     let storage: 'meta' | 'meta_bridge' = 'meta';
 
-    if (!isPersisted) {
-      const bridgeWriteOk = await this.setPageElementsViaMetaBridge(postId, elements, normalizedPostType, site);
-      if (bridgeWriteOk) {
-        const persistedFromBridge = await this.getPageElements(postId, normalizedPostType, site);
-        if (persistedFromBridge.element_count === elements.length) {
-          isPersisted = true;
-          storage = 'meta_bridge';
-        }
+    const bridgeWriteOk = await this.setPageElementsViaMetaBridge(postId, normalizedElements, normalizedPostType, site);
+    if (bridgeWriteOk) {
+      const bridgePersisted = await this.getPageElementsViaMetaBridge(postId, normalizedPostType, site);
+      if (Array.isArray(bridgePersisted) && this.persistedElementsContainExpected(normalizedElements, bridgePersisted)) {
+        isPersisted = true;
+        storage = 'meta_bridge';
       }
     }
 
     if (!isPersisted) {
+      await api.post(endpoint, {
+        meta: {
+          _bricks_page_content_2: JSON.stringify(normalizedElements),
+          _bricks_page_content: JSON.stringify(normalizedElements),
+          _bricks_page_settings: pageSettingsMeta,
+          _bricks_editor_mode: 'bricks',
+        },
+      });
+
+      const wpPersistedResponse = await api.get(endpoint, { params: { context: 'edit' } });
+      const wpPersistedElements = this.extractBricksElements(wpPersistedResponse.data);
+      isPersisted = this.persistedElementsContainExpected(normalizedElements, wpPersistedElements);
+      storage = 'meta';
+    }
+
+    if (!isPersisted) {
       throw new Error(
-        `Bricks meta persistence mismatch on post ${postId}: expected ${elements.length} elements in Bricks meta (_bricks_page_content_2), read back ${persisted.element_count}. REST meta appears blocked. Register Bricks meta with show_in_rest or install bridge endpoint /bricks-mcp/v1/page-elements.`
+        `Bricks meta persistence mismatch on post ${postId}: expected visual/layout settings were not fully persisted in Bricks meta (_bricks_page_content_2). This usually indicates REST meta sanitization. Ensure bridge endpoint /bricks-mcp/v1/page-elements is reachable and writable.`
       );
     }
 
     await this.cleanupVisibleBricksMarker(postId, normalizedPostType, site);
+
+    const persisted = await this.getPageElements(postId, normalizedPostType, site);
 
     return {
       post_id: persisted.post_id,
       post_type: normalizedPostType,
       title: persisted.title,
       status: persisted.status,
-      element_count: elements.length,
+      element_count: normalizedElements.length,
       persisted: isPersisted,
       storage,
       success: true,
