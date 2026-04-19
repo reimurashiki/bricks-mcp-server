@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Bricks MCP Meta Bridge
  * Description: Exposes a secure REST bridge for reading/writing Bricks page elements in post meta for MCP integrations.
- * Version: 1.0.0
+ * Version: 1.1.0
  */
 
 if (!defined('ABSPATH')) {
