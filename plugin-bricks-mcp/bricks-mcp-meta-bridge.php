@@ -295,21 +295,23 @@ add_action('rest_api_init', function () {
                 }
 
                 $elements_meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
+                $elements_meta_aliases = bricks_mcp_get_elements_meta_aliases($post_id, $elements_meta_key);
                 $editor_mode_key = bricks_mcp_get_editor_mode_key();
                 $page_settings_key = bricks_mcp_get_page_settings_key();
 
-                // Store only on resolved authoritative key to avoid cross-version key poisoning.
-                update_post_meta($post_id, $elements_meta_key, $elements_json);
+                // Store as JSON string across detected aliases to match Bricks versioned key readers.
+                foreach ($elements_meta_aliases as $meta_key) {
+                    update_post_meta($post_id, $meta_key, $elements_json);
+                }
 
-                $page_settings_json = wp_json_encode([
+                // Compatibility mirror for integrations still reading base key.
+                update_post_meta($post_id, '_bricks_page_content', $elements_json);
+
+                update_post_meta($post_id, $page_settings_key, [
                     'editorMode' => 'bricks',
                     'editor' => 'bricks',
                     'builder' => 'bricks',
-                ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-
-                if (is_string($page_settings_json)) {
-                    update_post_meta($post_id, $page_settings_key, $page_settings_json);
-                }
+                ]);
                 update_post_meta($post_id, $editor_mode_key, 'bricks');
 
                 $verified = bricks_mcp_get_elements_from_post($post_id);
