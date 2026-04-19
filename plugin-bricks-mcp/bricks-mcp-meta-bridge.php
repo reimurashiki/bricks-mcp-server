@@ -31,26 +31,149 @@ function bricks_mcp_get_page_settings_key() {
 function bricks_mcp_resolve_elements_meta_key($post_id) {
     $template_type = get_post_meta($post_id, '_bricks_template_type', true);
 
+    $base_key = '_bricks_page_content';
+
     if ($template_type === 'header') {
-        return defined('BRICKS_DB_PAGE_HEADER') && is_string(BRICKS_DB_PAGE_HEADER)
-            ? BRICKS_DB_PAGE_HEADER
-            : '_bricks_page_header_2';
+        $base_key = '_bricks_page_header';
     }
 
     if ($template_type === 'footer') {
-        return defined('BRICKS_DB_PAGE_FOOTER') && is_string(BRICKS_DB_PAGE_FOOTER)
-            ? BRICKS_DB_PAGE_FOOTER
-            : '_bricks_page_footer_2';
+        $base_key = '_bricks_page_footer';
     }
 
-    return defined('BRICKS_DB_PAGE_CONTENT') && is_string(BRICKS_DB_PAGE_CONTENT)
-        ? BRICKS_DB_PAGE_CONTENT
-        : '_bricks_page_content_2';
+    $preferred = '';
+    if ($base_key === '_bricks_page_header') {
+        $preferred = defined('BRICKS_DB_PAGE_HEADER') && is_string(BRICKS_DB_PAGE_HEADER)
+            ? BRICKS_DB_PAGE_HEADER
+            : '_bricks_page_header_2';
+    } elseif ($base_key === '_bricks_page_footer') {
+        $preferred = defined('BRICKS_DB_PAGE_FOOTER') && is_string(BRICKS_DB_PAGE_FOOTER)
+            ? BRICKS_DB_PAGE_FOOTER
+            : '_bricks_page_footer_2';
+    } else {
+        $preferred = defined('BRICKS_DB_PAGE_CONTENT') && is_string(BRICKS_DB_PAGE_CONTENT)
+            ? BRICKS_DB_PAGE_CONTENT
+            : '_bricks_page_content_2';
+    }
+
+    $all_meta = get_post_meta($post_id);
+    $available_keys = [];
+    if (is_array($all_meta)) {
+        foreach (array_keys($all_meta) as $meta_key) {
+            if (!is_string($meta_key)) {
+                continue;
+            }
+            if ($meta_key === $base_key || strpos($meta_key, $base_key . '_') === 0) {
+                $available_keys[] = $meta_key;
+            }
+        }
+    }
+
+    // Prefer keys that already contain data.
+    $priority = array_unique(array_merge([
+        $preferred,
+        $base_key . '_4',
+        $base_key . '_3',
+        $base_key . '_2',
+        $base_key,
+    ], $available_keys));
+
+    foreach ($priority as $candidate) {
+        if (!is_string($candidate) || $candidate === '') {
+            continue;
+        }
+
+        $value = get_post_meta($post_id, $candidate, true);
+        if ($value !== '' && $value !== null) {
+            return $candidate;
+        }
+    }
+
+    // If no non-empty key yet, prefer highest versioned key if present.
+    $best_key = '';
+    $best_version = -1;
+    foreach ($available_keys as $candidate) {
+        if ($candidate === $base_key) {
+            if ($best_key === '') {
+                $best_key = $candidate;
+            }
+            continue;
+        }
+
+        $suffix = str_replace($base_key . '_', '', $candidate);
+        $version = is_numeric($suffix) ? (int) $suffix : -1;
+        if ($version > $best_version) {
+            $best_version = $version;
+            $best_key = $candidate;
+        }
+    }
+
+    if ($best_key !== '') {
+        return $best_key;
+    }
+
+    return $preferred;
+}
+
+function bricks_mcp_get_elements_meta_aliases($post_id, $primary_key) {
+    $template_type = get_post_meta($post_id, '_bricks_template_type', true);
+    $base_key = '_bricks_page_content';
+
+    if ($template_type === 'header') {
+        $base_key = '_bricks_page_header';
+    }
+
+    if ($template_type === 'footer') {
+        $base_key = '_bricks_page_footer';
+    }
+
+    $aliases = [
+        $primary_key,
+        $base_key,
+        $base_key . '_2',
+        $base_key . '_3',
+        $base_key . '_4',
+    ];
+
+    if ($base_key === '_bricks_page_header' && defined('BRICKS_DB_PAGE_HEADER') && is_string(BRICKS_DB_PAGE_HEADER)) {
+        $aliases[] = BRICKS_DB_PAGE_HEADER;
+    }
+    if ($base_key === '_bricks_page_footer' && defined('BRICKS_DB_PAGE_FOOTER') && is_string(BRICKS_DB_PAGE_FOOTER)) {
+        $aliases[] = BRICKS_DB_PAGE_FOOTER;
+    }
+    if ($base_key === '_bricks_page_content' && defined('BRICKS_DB_PAGE_CONTENT') && is_string(BRICKS_DB_PAGE_CONTENT)) {
+        $aliases[] = BRICKS_DB_PAGE_CONTENT;
+    }
+
+    $all_meta = get_post_meta($post_id);
+    if (is_array($all_meta)) {
+        foreach (array_keys($all_meta) as $meta_key) {
+            if (!is_string($meta_key)) {
+                continue;
+            }
+            if ($meta_key === $base_key || strpos($meta_key, $base_key . '_') === 0) {
+                $aliases[] = $meta_key;
+            }
+        }
+    }
+
+    return array_values(array_unique(array_filter($aliases, function ($key) {
+        return is_string($key) && $key !== '';
+    })));
 }
 
 function bricks_mcp_get_elements_from_post($post_id) {
     $meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
-    $raw = get_post_meta($post_id, $meta_key, true);
+    $aliases = bricks_mcp_get_elements_meta_aliases($post_id, $meta_key);
+
+    $raw = '';
+    foreach ($aliases as $key) {
+        $value = get_post_meta($post_id, $key, true);
+        if ($value !== '' && $value !== null) {
+            $raw = $value;
+            break;
+        }
+    }
 
     if ($raw === '' || $raw === null) {
         $raw = get_post_meta($post_id, '_bricks_page_content', true);
@@ -181,11 +304,14 @@ add_action('rest_api_init', function () {
                 $elements = bricks_mcp_normalize_elements($elements);
 
                 $elements_meta_key = bricks_mcp_resolve_elements_meta_key($post_id);
+                $elements_meta_aliases = bricks_mcp_get_elements_meta_aliases($post_id, $elements_meta_key);
                 $editor_mode_key = bricks_mcp_get_editor_mode_key();
                 $page_settings_key = bricks_mcp_get_page_settings_key();
 
-                // Store as array post meta (Bricks reads this format natively).
-                update_post_meta($post_id, $elements_meta_key, $elements);
+                // Store as array post meta and mirror to versioned aliases.
+                foreach ($elements_meta_aliases as $meta_key) {
+                    update_post_meta($post_id, $meta_key, $elements);
+                }
 
                 // Compatibility mirror for integrations still checking this key.
                 update_post_meta($post_id, '_bricks_page_content', $elements);
